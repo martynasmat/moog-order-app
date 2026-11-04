@@ -1,5 +1,17 @@
 # moog-order-app
 
+## Windows executable
+
+Double-click `dist\MoogOrders.exe` to run the packaged app. The client does not need
+Python or a terminal. They still need classic Outlook installed and configured.
+
+To rebuild after code changes, double-click `build.bat` on this development machine.
+It uses the project's `.venv`, installs the build dependencies, and writes a new
+`dist\MoogOrders.exe`. Send that executable to the client; do not send the `.venv`
+or `build` folder. Build again whenever the source code changes.
+
+## Run from source
+
 Run the desktop app from the project folder:
 
 ```powershell

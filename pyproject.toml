@@ -9,5 +9,8 @@ description = "Parse order requests for Outlook email retrieval."
 requires-python = ">=3.11"
 dependencies = ["openpyxl>=3.1.5,<4", "pywin32; sys_platform == 'win32'", "PySide6>=6.8,<7"]
 
+[project.optional-dependencies]
+build = ["pyinstaller>=6,<7"]
+
 [tool.setuptools.packages.find]
 include = ["xlsx_parser*", "outlook_fetcher*", "gui*"]
