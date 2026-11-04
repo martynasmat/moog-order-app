@@ -3,29 +3,6 @@ import re
 import win32com.client
 
 
-def _prioritize_emails(emails, po, line):
-    if line is None:
-        return emails
-    po_pattern = r"PO\s*" + re.escape(po[2:]) if po.startswith("PO") else re.escape(po)
-    pattern = re.compile(
-        r"(?<![A-Z0-9])" + po_pattern + r"\s+(?:LN|LINE)\s*([A-Z0-9]+)",
-        re.IGNORECASE,
-    )
-    line = str(line).strip().upper()
-
-    def priority(email):
-        subject_lines = [value.upper() for value in pattern.findall(email["subject"])]
-        body_lines = [value.upper() for value in pattern.findall(email["body"])]
-        if line in subject_lines:
-            return 0
-        if line in body_lines:
-            return 1
-        return 3 if subject_lines or body_lines else 2
-
-    ranked = [(priority(email), email) for email in emails]
-    return [email for rank, email in sorted(ranked, key=lambda item: item[0]) if rank < 3]
-
-
 def fetch_emails(orders):
     if not orders:
         return []
@@ -64,6 +41,5 @@ def fetch_emails(orders):
     results = []
     for order in orders:
         po = re.sub(r"\s+", "", str(order["PO"])).upper()
-        emails = _prioritize_emails(emails_by_po[po], po, order["LINE"])
-        results.append({**order, "emails": emails})
+        results.append({**order, "emails": emails_by_po[po]})
     return results
