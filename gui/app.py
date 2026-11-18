@@ -165,7 +165,8 @@ class EmailViewer(QDialog):
             return
         try:
             outlook = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
-            outlook.GetItemFromID(self.emails[index]["entry_id"]).Display()
+            email = self.emails[index]
+            outlook.GetItemFromID(email["entry_id"], email["store_id"]).Display()
         except Exception as error:
             QMessageBox.warning(self, "Could not open email", str(error))
 
