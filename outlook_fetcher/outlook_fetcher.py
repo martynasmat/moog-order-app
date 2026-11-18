@@ -2,7 +2,7 @@
 
 Drop-in replacement for outlook_fetcher/outlook_fetcher.py:
 same function fetch_emails(orders), same input (order dicts with "PO" and optional "LINE"),
-same output (each order dict + "emails": [{entry_id, subject, sender, received_at, body}]).
+same order results, with store_id added to each email for Outlook lookups.
 
 How it is faster than the original:
 - each folder is searched by Outlook itself (DASL filter), not email-by-email in Python
@@ -31,7 +31,6 @@ TABLE_COLUMNS = ("Subject", "ReceivedTime", "SenderEmailAddress", "MessageClass"
 # a line list: numbers joined by "," "&" "+" "/" "and" "ir", or ranges "1-4" / "1 to 4".
 # plain spaces are NOT separators, so "LN2 5000vnt" gives {2}, not {2, 5000}
 _NUM_LIST = r"\d{1,3}(?:\s*(?:,|&|\+|/|-|–|\band\b|\bir\b|\bto\b)\s*\d{1,3})*"
-PO_RE = re.compile(r"(?<![A-Z0-9])PO\s*#?\s*(\d{6})(?!\d)", re.I)
 LN_RE = re.compile(r"^\s*[,;:/-]?\s*(?:LN|LINE|LINES|EIL\.?)\s*[:#]?\s*(" + _NUM_LIST + ")", re.I)
 LN_EXTRA_RE = re.compile(r"^\s*(?:,|&|\+|\band\b|\bir\b)\s*(?:LN|LINE)\s*(" + _NUM_LIST + ")", re.I)
 
@@ -49,12 +48,12 @@ def _expand(num_list):
     return out
 
 
-def parse_po_lines(text):
+def parse_po_lines(text, po_pattern):
     """'PO260378 LN3,6,9,12 + PO260535' -> {'PO260378': {3,6,9,12}, 'PO260535': None}
     None = PO mentioned without lines, i.e. the email is about the whole PO."""
     lines_by_po = {}
-    for m in PO_RE.finditer(text or ""):
-        po = "PO" + m.group(1)
+    for m in po_pattern.finditer(text or ""):
+        po = _norm_po(m.group())
         rest = text[m.end():m.end() + 80]
         lines = set()
         ln = LN_RE.match(rest)
@@ -80,8 +79,26 @@ def email_matches(order_po, order_line, found):
 
 
 def _norm_po(value):
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
     po = re.sub(r"\s+", "", str(value)).upper()
-    return po if po.startswith("PO") else "PO" + po
+    if po.startswith("PO#"):
+        return "PO" + po[3:]
+    return "PO" + po if po.isdecimal() else po
+
+
+def _po_pattern(wanted_pos):
+    alternatives = []
+    for po in sorted(wanted_pos, key=lambda po: (-len(po), po)):
+        if po.startswith("PO") and len(po) > 2:
+            suffix = po[2:]
+            prefix = r"PO\s*#?\s*"
+            if suffix.isdecimal():
+                prefix = rf"(?:{prefix})?"
+            alternatives.append(prefix + re.escape(suffix))
+        else:
+            alternatives.append(re.escape(po))
+    return re.compile(r"(?<![A-Z0-9])(?:" + "|".join(alternatives) + r")(?![A-Z0-9])", re.I)
 
 
 # ---------------------------------------------------------------- Outlook access
@@ -113,7 +130,8 @@ def _dasl(numbers, with_body=True):
     props = ['"urn:schemas:httpmail:subject"']
     if with_body:
         props.append('"urn:schemas:httpmail:textdescription"')
-    return "@SQL=" + " OR ".join(f"{p} LIKE '%{n}%'" for n in numbers for p in props)
+    escaped = [number.replace("'", "''") for number in numbers]
+    return "@SQL=" + " OR ".join(f"{p} LIKE '%{n}%'" for n in escaped for p in props)
 
 
 def _rows(folder, numbers):
@@ -162,35 +180,40 @@ def fetch_emails(orders):
         raise ValueError("A PO is required to fetch emails; LINE alone is not enough.")
 
     wanted_pos = {_norm_po(o["PO"]) for o in orders}
-    numbers = sorted(po[2:] for po in wanted_pos)
+    po_pattern = _po_pattern(wanted_pos)
+    numbers = sorted({po.removeprefix("PO") or po for po in wanted_pos})
 
     ns = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
-    emails = {}  # entry_id -> (email dict, parsed {PO: lines})
+    emails = {}  # (store_id, entry_id) -> (email dict, parsed {PO: lines})
 
     for folder in _mail_folders(ns):
+        try:
+            store_id = folder.StoreID
+        except Exception:
+            continue
         for entry_id, subject, received, sender in _rows(folder, numbers):
-            if entry_id in emails:
+            message_id = (store_id, entry_id)
+            if message_id in emails:
                 continue
-            # cheap check on the subject first; open the body only when needed
-            found = parse_po_lines(subject)
+            found = parse_po_lines(subject, po_pattern)
             try:
-                body = ns.GetItemFromID(entry_id).Body or ""
+                body = ns.GetItemFromID(entry_id, store_id).Body or ""
             except Exception:
                 body = ""
-            for po, lines in parse_po_lines(body).items():
-                if po not in found:
+            for po, lines in parse_po_lines(body, po_pattern).items():
+                if found.get(po) is None:
                     found[po] = lines
-                elif found[po] is not None and lines:
-                    found[po] |= lines
-            found = {po: ln for po, ln in found.items() if po in wanted_pos}
+                elif lines:
+                    found[po].update(lines)
             if not found:
                 continue
             try:
                 received_at = received.isoformat()
             except Exception:
                 received_at = str(received)
-            emails[entry_id] = ({"entry_id": entry_id, "subject": subject, "sender": sender,
-                                 "received_at": received_at, "body": body}, found)
+            emails[message_id] = ({"entry_id": entry_id, "store_id": store_id,
+                                   "subject": subject, "sender": sender,
+                                   "received_at": received_at, "body": body}, found)
 
     results = []
     for order in orders:
