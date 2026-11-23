@@ -1,21 +1,8 @@
-"""Outlook (classic) email fetcher for Moog orders  --  GetTable version.
+"""Find Outlook conversations by PO in email subjects and bodies.
 
-Drop-in replacement for outlook_fetcher/outlook_fetcher.py:
-same function fetch_emails(orders), same input (order dicts with "PO" and optional "LINE"),
-same order results, with store_id added to each email for Outlook lookups.
-
-How it is faster than the original:
-- each folder is searched by Outlook itself (DASL filter), not email-by-email in Python
-- the matching emails come back as one Table (EntryID, Subject, ReceivedTime, Sender)
-  in a single COM call instead of opening every email object
-- the full body is loaded only for emails that actually mention a PO from the Excel file
-
-What else changed vs. the original:
-- searches ALL mail folders in ALL mailboxes in the profile (Inbox subfolders, Sent Items,
-  archives, PSTs, shared mailboxes like supply.lt), not only the top-level Inbox
-- LN-aware: "PO260378 LN3,6,9,12" goes to rows LN3/6/9/12 only, not to LN4;
-  an email that mentions a PO without any LN goes to every row of that PO
-- one broken/protected email does not crash the scan; duplicates are counted once
+Each order includes a flat email list and the messages grouped by conversation.
+Rows for the same PO receive the same conversations. The LINE value is retained
+for classification.
 """
 import re
 import win32com.client
@@ -25,57 +12,7 @@ SKIP_FOLDERS = {"deleted items", "junk email", "junk e-mail", "sync issues", "co
                 "local failures", "server failures", "outbox",
                 "ištrinti elementai", "nepageidaujamas el. paštas"}
 TABLE_COLUMNS = ("Subject", "ReceivedTime", "SenderEmailAddress", "MessageClass")
-
-
-# ---------------------------------------------------------------- PO / LN parsing
-# a line list: numbers joined by "," "&" "+" "/" "and" "ir", or ranges "1-4" / "1 to 4".
-# plain spaces are NOT separators, so "LN2 5000vnt" gives {2}, not {2, 5000}
-_NUM_LIST = r"\d{1,3}(?:\s*(?:,|&|\+|/|-|–|\band\b|\bir\b|\bto\b)\s*\d{1,3})*"
-LN_RE = re.compile(r"^\s*[,;:/-]?\s*(?:LN|LINE|LINES|EIL\.?)\s*[:#]?\s*(" + _NUM_LIST + ")", re.I)
-LN_EXTRA_RE = re.compile(r"^\s*(?:,|&|\+|\band\b|\bir\b)\s*(?:LN|LINE)\s*(" + _NUM_LIST + ")", re.I)
-
-
-def _expand(num_list):
-    out = set()
-    for t in re.split(r"\s*(?:,|&|\+|/|\band\b|\bir\b)\s*", num_list, flags=re.I):
-        rng = re.match(r"(\d+)\s*(?:-|–|\bto\b)\s*(\d+)", t, re.I)
-        if rng:
-            a, b = int(rng.group(1)), int(rng.group(2))
-            if a <= b and b - a < 100:
-                out.update(range(a, b + 1))
-        elif t.strip().isdigit():
-            out.add(int(t))
-    return out
-
-
-def parse_po_lines(text, po_pattern):
-    """'PO260378 LN3,6,9,12 + PO260535' -> {'PO260378': {3,6,9,12}, 'PO260535': None}
-    None = PO mentioned without lines, i.e. the email is about the whole PO."""
-    lines_by_po = {}
-    for m in po_pattern.finditer(text or ""):
-        po = _norm_po(m.group())
-        rest = text[m.end():m.end() + 80]
-        lines = set()
-        ln = LN_RE.match(rest)
-        while ln:  # also handles "LN1, LN2 & LN5"
-            lines |= _expand(ln.group(1))
-            rest = rest[ln.end():]
-            ln = LN_EXTRA_RE.match(rest)
-        lines_by_po.setdefault(po, set()).update(lines)
-    return {po: (lines or None) for po, lines in lines_by_po.items()}
-
-
-def email_matches(order_po, order_line, found):
-    po = _norm_po(order_po)
-    if po not in found:
-        return False
-    lines = found[po]
-    if order_line in (None, "") or lines is None:
-        return True
-    try:
-        return int(float(order_line)) in lines
-    except (TypeError, ValueError):
-        return True
+STORE_ENTRY_ID = "https://schemas.microsoft.com/mapi/proptag/0x0FFB0102"
 
 
 def _norm_po(value):
@@ -126,23 +63,22 @@ def _mail_folders(namespace):
                 continue
 
 
-def _dasl(numbers, with_body=True):
-    props = ['"urn:schemas:httpmail:subject"']
-    if with_body:
-        props.append('"urn:schemas:httpmail:textdescription"')
+def _dasl(numbers):
+    props = ('"urn:schemas:httpmail:subject"', '"urn:schemas:httpmail:textdescription"')
     escaped = [number.replace("'", "''") for number in numbers]
     return "@SQL=" + " OR ".join(f"{p} LIKE '%{n}%'" for n in escaped for p in props)
 
 
 def _rows(folder, numbers):
-    """Yield (entry_id, subject, received, sender) for emails in folder that mention a number."""
-    table = None
-    for flt in (_dasl(numbers, True), _dasl(numbers, False)):  # body search may be unsupported
+    """Yield candidate mail rows for the subject and body search."""
+    try:
+        table = folder.GetTable(_dasl(numbers))
+    except Exception:
+        # Some Outlook stores cannot filter on the body. Check each message in those folders.
         try:
-            table = folder.GetTable(flt)
-            break
+            table = folder.GetTable()
         except Exception:
-            table = None
+            return
     if table is None:
         return
     try:
@@ -173,6 +109,57 @@ def list_mail_folders():
     return out
 
 
+def _conversation_ids(item):
+    members = set()
+    try:
+        conversation = item.GetConversation()
+        if conversation is None:
+            return members
+        table = conversation.GetTable()
+        table.Columns.Add(STORE_ENTRY_ID)
+        while not table.EndOfTable:
+            row = table.GetNextRow()
+            try:
+                if not str(row.Item("MessageClass") or "").startswith("IPM.Note"):
+                    continue
+                store_id = row.BinaryToString(STORE_ENTRY_ID)
+                entry_id = row.Item("EntryID")
+                if store_id and entry_id:
+                    members.add((store_id, entry_id))
+            except Exception:
+                continue  # A bad row should not hide the rest of the conversation.
+    except Exception:
+        pass  # Keep the original match if Outlook cannot enumerate its conversation.
+    return members
+
+
+def _message_body(item):
+    try:
+        return item.Body or ""
+    except Exception:
+        return ""
+
+
+def _email_data(message_id, subject, received, sender, body):
+    store_id, entry_id = message_id
+    try:
+        received_at = received.isoformat()
+    except (AttributeError, ValueError):
+        received_at = str(received)
+    return {"entry_id": entry_id, "store_id": store_id, "subject": subject,
+            "sender": sender, "received_at": received_at, "body": body}
+
+
+def _read_conversation_email(namespace, message_id):
+    store_id, entry_id = message_id
+    try:
+        item = namespace.GetItemFromID(entry_id, store_id)
+        return _email_data(message_id, item.Subject or "", item.ReceivedTime,
+                           item.SenderEmailAddress or "", _message_body(item))
+    except Exception:
+        return None
+
+
 def fetch_emails(orders):
     if not orders:
         return []
@@ -184,7 +171,9 @@ def fetch_emails(orders):
     numbers = sorted({po.removeprefix("PO") or po for po in wanted_pos})
 
     ns = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
-    emails = {}  # (store_id, entry_id) -> (email dict, parsed {PO: lines})
+    emails = {}  # (store_id, entry_id) -> email dict
+    seeds = {}  # Matching messages and the PO references they contain.
+    conversations = {}  # Message ID -> sorted tuple of conversation member IDs.
 
     for folder in _mail_folders(ns):
         try:
@@ -193,34 +182,58 @@ def fetch_emails(orders):
             continue
         for entry_id, subject, received, sender in _rows(folder, numbers):
             message_id = (store_id, entry_id)
-            if message_id in emails:
+            if message_id in seeds:
                 continue
-            found = parse_po_lines(subject, po_pattern)
             try:
-                body = ns.GetItemFromID(entry_id, store_id).Body or ""
+                item = ns.GetItemFromID(entry_id, store_id)
             except Exception:
-                body = ""
-            for po, lines in parse_po_lines(body, po_pattern).items():
-                if found.get(po) is None:
-                    found[po] = lines
-                elif lines:
-                    found[po].update(lines)
+                item = None
+            body = _message_body(item) if item is not None else ""
+            found = {
+                _norm_po(match.group())
+                for text in (subject, body)
+                for match in po_pattern.finditer(text)
+            }
             if not found:
                 continue
-            try:
-                received_at = received.isoformat()
-            except Exception:
-                received_at = str(received)
-            emails[message_id] = ({"entry_id": entry_id, "store_id": store_id,
-                                   "subject": subject, "sender": sender,
-                                   "received_at": received_at, "body": body}, found)
+            seeds[message_id] = found
+            emails[message_id] = _email_data(message_id, subject, received, sender, body)
+            if item is not None and message_id not in conversations:
+                members = _conversation_ids(item)
+                if members:
+                    members.add(message_id)
+                    for member_id in tuple(members):
+                        members.update(conversations.get(member_id, ()))
+                    member_ids = tuple(sorted(members))
+                    for member_id in member_ids:
+                        conversations[member_id] = member_ids
 
     results = []
     for order in orders:
-        matched = [e for e, found in emails.values()
-                   if email_matches(order["PO"], order.get("LINE"), found)]
-        matched.sort(key=lambda e: e["received_at"])
-        results.append({**order, "emails": matched})
+        po = _norm_po(order["PO"])
+        matched_groups = {
+            conversations.get(message_id, (message_id,))
+            for message_id, found in seeds.items()
+            if po in found
+        }
+        matched = {}
+        chains = []
+        for member_ids in sorted(matched_groups):
+            chain = []
+            for message_id in member_ids:
+                if message_id not in emails:
+                    emails[message_id] = _read_conversation_email(ns, message_id)
+                email = emails[message_id]
+                if email is not None:
+                    chain.append(email)
+                    matched[message_id] = email
+            if chain:
+                chain.sort(key=lambda email: email["received_at"])
+                chains.append(chain)
+        chains.sort(key=lambda chain: chain[0]["received_at"])
+        ordered_emails = [matched[message_id] for message_id in sorted(matched)]
+        ordered_emails.sort(key=lambda email: email["received_at"])
+        results.append({**order, "emails": ordered_emails, "conversations": chains})
     return results
 
 
